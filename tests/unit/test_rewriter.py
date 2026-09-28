@@ -106,7 +106,7 @@ async def test_timeout_returns_original_query():
         result = await rewriter.rewrite("original query", history=HISTORY, timeout_sec=timeout_sec)
     elapsed = time.perf_counter() - start
 
-    assert result == "original query"
+    assert result == "previous turn original query"
     # Real cutoff: returns well before the 1.0s delay, not after waiting it out.
     assert elapsed < timeout_sec * 5, f"took {elapsed:.2f}s, expected a cutoff near {timeout_sec}s"
     # The awaited generate() coroutine must have been cancelled, not left to
@@ -305,3 +305,63 @@ async def test_normal_output_without_think_tags_is_unaltered():
         result = await rewriter.rewrite("original query", history=HISTORY)
 
     assert result == "standalone rewritten query, no tags here"
+
+
+@pytest.mark.asyncio
+async def test_timeout_fallback_needs_a_previous_user_question():
+    """Without a prior user turn (or when it repeats the query) the timeout
+    fallback stays the original query; long prior questions are bounded."""
+    from src.core.retrieval.application.query.rewriter import _history_fallback
+
+    assert _history_fallback("q", [{"role": "assistant", "content": "a"}]) == "q"
+    assert _history_fallback("q", "User: text") == "q"
+    assert _history_fallback("q", [{"role": "user", "content": "q"}]) == "q"
+    long_prev = [{"role": "user", "content": "x" * 1000}, {"role": "assistant", "content": "a"}]
+    assert _history_fallback("q", long_prev) == "x" * 300 + " q"
+
+
+def test_timeout_fallback_keeps_the_topic_from_two_questions_back():
+    """Turn 3 of "hide View Mail?" -> "now draft a reply" -> "improve the commands":
+    the topic is only in the first question, so the last two are kept, oldest first."""
+    from src.core.retrieval.application.query.rewriter import _history_fallback
+
+    history = [
+        {"role": "user", "content": "topic question"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "draft a reply"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    assert _history_fallback("improve it", history) == "topic question draft a reply improve it"
+    older = [{"role": "user", "content": "oldest"}, *history]
+    assert _history_fallback("improve it", older) == "topic question draft a reply improve it"
+
+
+def test_default_timeout_leaves_room_for_a_cloud_rewrite():
+    """Measured on production: follow-up rewrites took 4-20s on a reasoning
+    model and ~1-6s on the economy model; 4.5s cut off almost all of them."""
+    import inspect
+
+    from src.core.retrieval.application.query.rewriter import QueryRewriter
+
+    assert inspect.signature(QueryRewriter.rewrite).parameters["timeout_sec"].default == 8.0
+
+
+@pytest.mark.asyncio
+async def test_provider_error_keeps_the_topic_like_a_timeout(caplog):
+    """A failing rewrite (e.g. misconfigured provider) must degrade like a
+    timeout: previous user questions + query, not the bare follow-up."""
+    mock_provider = MagicMock()
+
+    async def _generate(*args, **kwargs):
+        raise RuntimeError("provider unavailable")
+
+    mock_provider.generate = _generate
+    mock_factory = MagicMock()
+    mock_factory.get_llm_provider.return_value = mock_provider
+    rewriter = QueryRewriter(provider=mock_provider, provider_factory=mock_factory)
+    p1, p2 = _patches()
+    with p1, p2, caplog.at_level("ERROR"):
+        result = await rewriter.rewrite("original query", history=HISTORY)
+
+    assert result == "previous turn original query"
+    assert any("Query rewrite failed" in r.message for r in caplog.records)
